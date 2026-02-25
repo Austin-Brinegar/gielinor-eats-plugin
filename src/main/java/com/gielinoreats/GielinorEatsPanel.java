@@ -12,8 +12,9 @@ import java.awt.Font;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
-import java.text.SimpleDateFormat;
-import java.util.Date;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
 import javax.swing.JButton;
@@ -191,8 +192,8 @@ public class GielinorEatsPanel extends PluginPanel
 		gbc.fill = GridBagConstraints.HORIZONTAL;
 		entry.add(ts, gbc);
 
-		// Message
-		JLabel msg = new JLabel("<html>" + n.message + "</html>");
+		// Message — escape HTML to prevent injection via server-supplied notification text
+		JLabel msg = new JLabel("<html>" + escapeHtml(n.message) + "</html>");
 		msg.setForeground(Color.WHITE);
 		msg.setFont(FontManager.getRunescapeSmallFont());
 		gbc.gridy = 1;
@@ -235,7 +236,7 @@ public class GielinorEatsPanel extends PluginPanel
 
 	// ── Private helpers ────────────────────────────────────────────────────────
 
-	private void showIdleState()
+	public void showIdleState()
 	{
 		statusLabel.setText("No active order");
 		secondaryLabel.setText("");
@@ -339,7 +340,10 @@ public class GielinorEatsPanel extends PluginPanel
 		}
 	}
 
-	private String formatTimestamp(String isoTimestamp)
+	private static final DateTimeFormatter TIME_FMT =
+		DateTimeFormatter.ofPattern("HH:mm").withZone(ZoneId.systemDefault());
+
+	private static String formatTimestamp(String isoTimestamp)
 	{
 		if (isoTimestamp == null)
 		{
@@ -347,16 +351,25 @@ public class GielinorEatsPanel extends PluginPanel
 		}
 		try
 		{
-			// ISO 8601 parse — strip trailing Z for SimpleDateFormat compatibility
-			String normalised = isoTimestamp.replace("Z", "+00:00").replace("+00:00", "");
-			SimpleDateFormat parser = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS");
-			Date d = parser.parse(normalised);
-			return new SimpleDateFormat("HH:mm").format(d);
+			return TIME_FMT.format(Instant.parse(isoTimestamp));
 		}
 		catch (Exception e)
 		{
 			return "";
 		}
+	}
+
+	/** Escapes characters that have special meaning in Swing HTML rendering. */
+	private static String escapeHtml(String s)
+	{
+		if (s == null)
+		{
+			return "";
+		}
+		return s.replace("&", "&amp;")
+			.replace("<", "&lt;")
+			.replace(">", "&gt;")
+			.replace("\"", "&quot;");
 	}
 
 	private JPanel buildShortestPathWarning()
@@ -433,12 +446,15 @@ public class GielinorEatsPanel extends PluginPanel
 		return panel;
 	}
 
+	private static final java.util.regex.Pattern LINK_CODE_PATTERN =
+		java.util.regex.Pattern.compile("^[A-Z0-9]{6}$");
+
 	private void onLinkAccountClicked()
 	{
 		String code = linkCodeField.getText().trim();
-		if (code.length() != 6)
+		if (!LINK_CODE_PATTERN.matcher(code).matches())
 		{
-			showLinkError("Code must be 6 characters.");
+			showLinkError("Code must be 6 alphanumeric characters.");
 			return;
 		}
 		linkStatusLabel.setText("Linking...");
@@ -447,7 +463,7 @@ public class GielinorEatsPanel extends PluginPanel
 		plugin.onLinkAccount(code);
 	}
 
-	private void clearNotifications()
+	public void clearNotifications()
 	{
 		notificationList.removeAll();
 		notificationList.revalidate();

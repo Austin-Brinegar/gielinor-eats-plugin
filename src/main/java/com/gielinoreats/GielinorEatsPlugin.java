@@ -148,6 +148,13 @@ public class GielinorEatsPlugin extends Plugin
 			case LOGIN_SCREEN:
 			case HOPPING:
 				stopPresenceSync();
+				// Clear panel state so a different account on the same client
+				// does not see the previous session's notifications or order status
+				SwingUtilities.invokeLater(() ->
+				{
+					panel.showIdleState();
+					panel.clearNotifications();
+				});
 				break;
 			default:
 				break;

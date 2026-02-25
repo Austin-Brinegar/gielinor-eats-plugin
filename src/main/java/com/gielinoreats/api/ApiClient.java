@@ -26,16 +26,11 @@ public class ApiClient
 
 	private final OkHttpClient http;
 	private final Gson gson = new Gson();
-	private String token;
+	private final String token;
 
 	public ApiClient(OkHttpClient http, String token)
 	{
 		this.http = http;
-		this.token = token;
-	}
-
-	public void updateToken(String token)
-	{
 		this.token = token;
 	}
 
