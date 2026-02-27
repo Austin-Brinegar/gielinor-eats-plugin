@@ -231,6 +231,8 @@ public class GielinorEatsPanel extends PluginPanel
 	{
 		linkStatusLabel.setText(message);
 		linkStatusLabel.setForeground(COLOR_RED);
+		linkAccountButton.setEnabled(true);
+		linkCodeField.setEnabled(true);
 		revalidate();
 	}
 

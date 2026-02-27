@@ -196,7 +196,7 @@ public class ApiClient
 			.url(BASE_URL + endpoint)
 			.addHeader("Authorization", "Bearer " + token)
 			.addHeader("Content-Type", "application/json")
-			.post(RequestBody.create(jsonBody, JSON))
+			.post(RequestBody.create(JSON, jsonBody))
 			.build();
 	}
 

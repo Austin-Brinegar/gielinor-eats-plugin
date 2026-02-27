@@ -10,6 +10,7 @@ import com.gielinoreats.model.PresenceSyncResponse;
 import com.google.inject.Provides;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -27,11 +28,9 @@ import net.runelite.api.InventoryID;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.Player;
-import net.runelite.api.TradeOffer;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.ItemContainerChanged;
-import net.runelite.api.events.TradeChanged;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.Notifier;
@@ -91,6 +90,10 @@ public class GielinorEatsPlugin extends Plugin
 	private volatile String lastPollTime;
 	private volatile boolean lastInventoryCheckResult = false;
 
+	// Inventory snapshot taken when runner enters PENDING_TRADE, used to detect
+	// what items were given/received when the trade window closes
+	private volatile Map<Integer, Integer> inventorySnapshot = null;
+
 	// ── Plugin lifecycle ───────────────────────────────────────────────────────
 
 	@Override
@@ -127,6 +130,7 @@ public class GielinorEatsPlugin extends Plugin
 		activeOrder = null;
 		lastPollTime = null;
 		lastInventoryCheckResult = false;
+		inventorySnapshot = null;
 	}
 
 	@Provides
@@ -148,6 +152,7 @@ public class GielinorEatsPlugin extends Plugin
 			case LOGIN_SCREEN:
 			case HOPPING:
 				stopPresenceSync();
+				inventorySnapshot = null;
 				// Clear panel state so a different account on the same client
 				// does not see the previous session's notifications or order status
 				SwingUtilities.invokeLater(() ->
@@ -168,50 +173,48 @@ public class GielinorEatsPlugin extends Plugin
 		{
 			return;
 		}
-		if (lastKnownOrderStatus != DeliveryStatus.PREPARING)
+
+		// ── Runner: inventory ready check (PREPARING) ──────────────────────────
+		if (lastKnownOrderStatus == DeliveryStatus.PREPARING
+			&& activeOrder != null && activeOrderId != null)
 		{
-			return;
-		}
-		if (activeOrder == null || activeOrderId == null)
-		{
-			return;
+			boolean nowReady = checkInventoryAgainstOrder(event.getItemContainer());
+			if (nowReady && !lastInventoryCheckResult)
+			{
+				apiClient.reportInventoryReady(activeOrderId, response ->
+					setShortestPathDestination(new WorldPoint(
+						response.requesterX, response.requesterY, response.requesterPlane)));
+			}
+			lastInventoryCheckResult = nowReady;
 		}
 
-		boolean nowReady = checkInventoryAgainstOrder(event.getItemContainer());
-		if (nowReady && !lastInventoryCheckResult)
+		// ── Runner: trade completion detection (PENDING_TRADE) ─────────────────
+		// Strategy: snapshot inventory when we enter PENDING_TRADE; on each
+		// subsequent inventory change, check whether the items we were supposed
+		// to deliver have left our inventory. If so, the trade completed.
+		if (lastKnownOrderStatus == DeliveryStatus.PENDING_TRADE
+			&& activeOrder != null && activeOrder.isRunner()
+			&& activeOrderId != null)
 		{
-			apiClient.reportInventoryReady(activeOrderId, response ->
-				setShortestPathDestination(new WorldPoint(
-					response.requesterX, response.requesterY, response.requesterPlane)));
-		}
-		lastInventoryCheckResult = nowReady;
-	}
+			Map<Integer, Integer> snapshot = inventorySnapshot;
+			if (snapshot == null)
+			{
+				return;
+			}
 
-	@Subscribe
-	public void onTradeChanged(TradeChanged event)
-	{
-		if (lastKnownOrderStatus != DeliveryStatus.PENDING_TRADE)
-		{
-			return;
-		}
-		if (activeOrderId == null)
-		{
-			return;
-		}
+			Map<Integer, Integer> current = countItems(event.getItemContainer());
 
-		TradeOffer myOffer = client.getTrade(TradeOffer.Side.SELF);
-		TradeOffer theirOffer = client.getTrade(TradeOffer.Side.THEM);
+			// Verify all requested items have left the inventory
+			if (activeOrder.requestedItems != null && !activeOrder.requestedItems.isEmpty()
+				&& allItemsDelivered(snapshot, current))
+			{
+				// Prevent double-reporting
+				inventorySnapshot = null;
 
-		if (myOffer == null || theirOffer == null)
-		{
-			return;
-		}
-
-		if (myOffer.isAccepted() && theirOffer.isAccepted())
-		{
-			List<OrderItem> itemsGiven = extractTradeItems(myOffer.getItems());
-			List<OrderItem> itemsReceived = extractTradeItems(theirOffer.getItems());
-			apiClient.reportTradeCompleted(activeOrderId, itemsGiven, itemsReceived);
+				List<OrderItem> given = itemsDecreased(snapshot, current);
+				List<OrderItem> received = itemsIncreased(snapshot, current);
+				apiClient.reportTradeCompleted(activeOrderId, given, received);
+			}
 		}
 	}
 
@@ -267,11 +270,32 @@ public class GielinorEatsPlugin extends Plugin
 		lastPollTime = response.serverTime;
 
 		DeliveryStatus newStatus = DeliveryStatus.fromString(response.orderStatus);
-		lastKnownOrderStatus = newStatus;
-		activeOrder = response.activeOrder;
-		activeOrderId = response.activeOrder != null ? response.activeOrder.orderId : null;
+		ActiveOrder newOrder = response.activeOrder;
 
-		// Reset edge-transition guard when leaving PREPARING
+		// Snapshot inventory on transition into PENDING_TRADE (runner only)
+		if (newStatus == DeliveryStatus.PENDING_TRADE
+			&& lastKnownOrderStatus != DeliveryStatus.PENDING_TRADE
+			&& newOrder != null && newOrder.isRunner()
+			&& inventorySnapshot == null)
+		{
+			ItemContainer inv = client.getItemContainer(InventoryID.INVENTORY);
+			if (inv != null)
+			{
+				inventorySnapshot = countItems(inv);
+			}
+		}
+
+		// Clear snapshot if no longer in PENDING_TRADE
+		if (newStatus != DeliveryStatus.PENDING_TRADE)
+		{
+			inventorySnapshot = null;
+		}
+
+		lastKnownOrderStatus = newStatus;
+		activeOrder = newOrder;
+		activeOrderId = newOrder != null ? newOrder.orderId : null;
+
+		// Reset inventory-ready edge guard when leaving PREPARING
 		if (newStatus != DeliveryStatus.PREPARING)
 		{
 			lastInventoryCheckResult = false;
@@ -279,7 +303,7 @@ public class GielinorEatsPlugin extends Plugin
 
 		SwingUtilities.invokeLater(() -> panel.updateStatus(response));
 		processNotifications(response.notifications);
-		checkTradeAbandonCondition(newStatus, response.activeOrder);
+		checkTradeAbandonCondition(newStatus, newOrder);
 	}
 
 	// ── Trade abandon proximity check ──────────────────────────────────────────
@@ -374,7 +398,7 @@ public class GielinorEatsPlugin extends Plugin
 		}
 	}
 
-	// ── Inventory check ────────────────────────────────────────────────────────
+	// ── Inventory helpers ──────────────────────────────────────────────────────
 
 	/**
 	 * Check whether the inventory satisfies all items in the active order.
@@ -388,20 +412,10 @@ public class GielinorEatsPlugin extends Plugin
 			return false;
 		}
 
-		Map<Integer, Integer> counts = new HashMap<>();
-		for (Item item : inventory.getItems())
-		{
-			if (item.getId() == -1)
-			{
-				continue;
-			}
-			counts.merge(item.getId(), item.getQuantity(), Integer::sum);
-		}
-
+		Map<Integer, Integer> counts = countItems(inventory);
 		for (OrderItem required : activeOrder.requestedItems)
 		{
-			int held = counts.getOrDefault(required.itemId, 0);
-			if (held < required.quantity)
+			if (counts.getOrDefault(required.itemId, 0) < required.quantity)
 			{
 				return false;
 			}
@@ -409,26 +423,63 @@ public class GielinorEatsPlugin extends Plugin
 		return true;
 	}
 
-	private List<OrderItem> extractTradeItems(Item[] items)
+	/** Returns true if every requested item has decreased by at least the required quantity. */
+	private boolean allItemsDelivered(Map<Integer, Integer> before, Map<Integer, Integer> after)
+	{
+		for (OrderItem required : activeOrder.requestedItems)
+		{
+			int had = before.getOrDefault(required.itemId, 0);
+			int now = after.getOrDefault(required.itemId, 0);
+			if (had < required.quantity || now > had - required.quantity)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	/** Items whose quantity decreased between two snapshots (i.e. items given). */
+	private List<OrderItem> itemsDecreased(Map<Integer, Integer> before, Map<Integer, Integer> after)
+	{
+		List<OrderItem> result = new ArrayList<>();
+		for (Map.Entry<Integer, Integer> entry : before.entrySet())
+		{
+			int delta = entry.getValue() - after.getOrDefault(entry.getKey(), 0);
+			if (delta > 0)
+			{
+				result.add(new OrderItem(entry.getKey(), delta));
+			}
+		}
+		return result;
+	}
+
+	/** Items whose quantity increased between two snapshots (i.e. items received). */
+	private List<OrderItem> itemsIncreased(Map<Integer, Integer> before, Map<Integer, Integer> after)
+	{
+		List<OrderItem> result = new ArrayList<>();
+		for (Map.Entry<Integer, Integer> entry : after.entrySet())
+		{
+			int delta = entry.getValue() - before.getOrDefault(entry.getKey(), 0);
+			if (delta > 0)
+			{
+				result.add(new OrderItem(entry.getKey(), delta));
+			}
+		}
+		return result;
+	}
+
+	/** Counts all non-empty item stacks in a container into a map of itemId → quantity. */
+	private static Map<Integer, Integer> countItems(ItemContainer container)
 	{
 		Map<Integer, Integer> counts = new HashMap<>();
-		if (items != null)
+		for (Item item : container.getItems())
 		{
-			for (Item item : items)
+			if (item.getId() != -1)
 			{
-				if (item.getId() == -1)
-				{
-					continue;
-				}
 				counts.merge(item.getId(), item.getQuantity(), Integer::sum);
 			}
 		}
-		List<OrderItem> result = new ArrayList<>();
-		for (Map.Entry<Integer, Integer> entry : counts.entrySet())
-		{
-			result.add(new OrderItem(entry.getKey(), entry.getValue()));
-		}
-		return result;
+		return Collections.unmodifiableMap(counts);
 	}
 
 	// ── Shortest Path integration ──────────────────────────────────────────────
